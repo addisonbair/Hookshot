@@ -1672,10 +1672,14 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         // tables) hung the GPU when the driver's optimizer built them: a device lost one to four minutes into Kokiri, each time with
         // another of them first (RX 6600, issues 461 and 484); never in runs where they were built without it. They are built
         // without it on AMD. RX_VK_MESH_OPT=1: with it, as the others)
+        // (hookshot) Not on Mesa's RADV: there the task programs built without it run long enough to reset the GPU at the
+        // Great Deku Tree (Steam Deck OLED, RX 6800 XT; issue 1000), and built with it they play.
         static const bool amd = [] {
-            VkPhysicalDeviceProperties pr{};
-            vkGetPhysicalDeviceProperties(dev.physical, &pr);
-            return pr.vendorID == 0x1002;
+            VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            p2.pNext = &dp;
+            vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+            return p2.properties.vendorID == 0x1002 && dp.driverID != VK_DRIVER_ID_MESA_RADV;
         }();
         static const bool mesh_opt = getenv("RX_VK_MESH_OPT") != nullptr;
         if (amd && !mesh_opt) {
