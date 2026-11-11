@@ -1067,7 +1067,32 @@ struct SubmittedPage {
     bool overlay = false;   // (bytes is the capture's copy of the page; otherwise guest memory stands)
     uint8_t bytes[4096]{};
 };
-thread_local SubmittedPage submitted_page;
+// (hookshot) Several pages, not one: a draw's reads went back and forth between a handle table and a uniform buffer, and every
+// switch copied the whole page again (Kokiri: the replay's busiest work, memmove). A page is copied once a capture view now.
+// RX_VK_SUBMITTED_PAGES=<n>: that many (1: as before, at most 64)
+constexpr int kSubmittedPagesMax = 64;
+thread_local SubmittedPage submitted_pages[kSubmittedPagesMax];
+thread_local int submitted_next = 0;
+int submitted_pages_n() {
+    static const int n = std::clamp(getenv("RX_VK_SUBMITTED_PAGES") ? atoi(getenv("RX_VK_SUBMITTED_PAGES")) : 64, 1, kSubmittedPagesMax);
+    return n;
+}
+SubmittedPage* submitted_find(uint64_t page, uint32_t pgen, uint64_t view) {
+    const int n = submitted_pages_n();
+    for (int i = 0; i < n; i++) {
+        SubmittedPage& sp = submitted_pages[i];
+        if (submitted_page_reuse(page, pgen, view, sp.page, sp.pgen, sp.view)) return &sp;
+    }
+    return nullptr;
+}
+SubmittedPage& submitted_slot(uint64_t page) {   // (the page's slot if it has one, else the next in turn)
+    const int n = submitted_pages_n();
+    for (int i = 0; i < n; i++)
+        if (submitted_pages[i].page == page) return submitted_pages[i];
+    SubmittedPage& sp = submitted_pages[submitted_next];
+    submitted_next = (submitted_next + 1) % n;
+    return sp;
+}
 
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. The next words are
@@ -1077,11 +1102,12 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
         if (guest) {
             const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
             const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
-            if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page,
-                                                       submitted_page.pgen, submitted_page.view) &&
-                submitted_page.overlay) {
-                std::memcpy(dst, submitted_page.bytes + (guest & 4095), (size_t)n);
-                return true;
+            if (page0 == page1) {
+                const SubmittedPage* sp = submitted_find(page0, page_gen(page0), view);
+                if (sp && sp->overlay) {
+                    std::memcpy(dst, sp->bytes + (guest & 4095), (size_t)n);
+                    return true;
+                }
             }
         }
     }
@@ -1091,9 +1117,7 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     if (!guest) return true;
     const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
     const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
-    if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page, submitted_page.pgen,
-                                               submitted_page.view))
-        return true;
+    if (page0 == page1 && submitted_find(page0, page_gen(page0), view)) return true;
     static std::atomic<int64_t> reads{0}, pages_from{0};
     int64_t from = 0;
     {
@@ -1108,16 +1132,17 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             from++;
         }
         if (page0 == page1) {
-            submitted_page.page = page0;
-            submitted_page.pgen = page_gen(page0);
-            submitted_page.view = cap_view_gen.load(std::memory_order_relaxed);
-            submitted_page.overlay = false;
+            SubmittedPage& sp = submitted_slot(page0);
+            sp.page = page0;
+            sp.pgen = page_gen(page0);
+            sp.view = cap_view_gen.load(std::memory_order_relaxed);
+            sp.overlay = false;
             const CapEntry e = cap_entry(page0);
-            if (e.gen && e.gen == submitted_page.pgen) {
+            if (e.gen && e.gen == sp.pgen) {
                 auto b = cap_bufs.find(e.gen);
                 if (b != cap_bufs.end() && b->second.map) {
-                    std::memcpy(submitted_page.bytes, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, 4096);
-                    submitted_page.overlay = true;
+                    std::memcpy(sp.bytes, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, 4096);
+                    sp.overlay = true;
                 }
             }
         }
