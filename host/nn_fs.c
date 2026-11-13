@@ -374,7 +374,15 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
       if (!want_write && hos_ultrawide_redirect(g, alt, sizeof alt)) snprintf(path, sizeof path, "%s", alt); }
     if (!want_write && hos_blank_cached_icon(g, path)) { if (away) hos_vcore_back(); RET(R_PATH_NOT_FOUND); return; }
     {   /* HOS_FS_OVERLAY=<folder> (a test): a file of the game's data found there is read in place of the game's own */
-        const char *ov = getenv("HOS_FS_OVERLAY");
+        /* (read once: every OpenFile asked the environment; one atomic pointer, "" until read, so a thread sees the
+           value or reads it itself) */
+        static const char *overlay = "";
+        const char *ov = __atomic_load_n(&overlay, __ATOMIC_RELAXED);
+        if (ov && !*ov) {
+            ov = getenv("HOS_FS_OVERLAY");
+            if (ov && !*ov) ov = NULL;   /* (set but empty: no overlay, as before) */
+            __atomic_store_n(&overlay, ov, __ATOMIC_RELAXED);
+        }
         const char *rel = !want_write && ov ? strstr(g, ":/") : NULL;
         if (rel) {
             char alt[HOS_FS_PATH];
@@ -620,8 +628,12 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {
     G64(ARG(0)) = new_handle(dh);
     RET(0);
 }
+/* (hookshot) A directory's listing is read, counted and closed under one lock: a CloseDirectory on another guest thread freed
+   the handle (and its find handle) while a ReadDirectory or GetDirectoryEntryCount still walked it */
+static SRWLOCK dir_lock = SRWLOCK_INIT;
 /* ReadDirectory(long* count, DirectoryEntry* entries, DirectoryHandle, long max) */
 HLE(_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl) {
+    AcquireSRWLockExclusive(&dir_lock);
     Handle *dh = get_handle(c, ARG(2));
     int64_t n = 0, max = (int64_t)ARG(3);
     while (n < max && !dh->find_done) {
@@ -648,11 +660,13 @@ HLE(_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl) {
         G64(e + 0x308) = x->size;
         n++;
     }
+    ReleaseSRWLockExclusive(&dir_lock);
     G64(ARG(0)) = (uint64_t)n;
     RET(0);
 }
 /* (hookshot) GetDirectoryEntryCount(long* count, DirectoryHandle): every entry the open mode lists, read or not */
 HLE(_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE) {
+    AcquireSRWLockExclusive(&dir_lock);
     Handle *dh = get_handle(c, ARG(1));
     int64_t n = 0;
     WIN32_FIND_DATAA fd;
@@ -668,13 +682,16 @@ HLE(_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE) {
     }
     for (int i = 0; i < dh->nextras; i++)
         n += (dh->extras[i].is_dir && (dh->is_dir & 1)) || (!dh->extras[i].is_dir && (dh->is_dir & 2));
+    ReleaseSRWLockExclusive(&dir_lock);
     G64(ARG(0)) = (uint64_t)n;
     RET(0);
 }
 HLE(_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE) {
+    AcquireSRWLockExclusive(&dir_lock);
     Handle *dh = get_handle(c, ARG(0));
     if (dh->find != INVALID_HANDLE_VALUE) FindClose(dh->find);
     free_handle(ARG(0));
+    ReleaseSRWLockExclusive(&dir_lock);
     free(dh->extras);
     free(dh);
 }

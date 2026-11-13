@@ -31,13 +31,23 @@ WITHOUT_SHADERS = {"download": (0, 0.04), "read": (0.04, 0.04), "lift": (0.08, 0
 WITH_SHADERS = {"download": (0, 0.04), "read": (0.04, 0.04), "lift": (0.08, 0.14), "compile": (0.22, 0.68), "finish": (0.90, 0.02),
                 "shaders": (0.92, 0.08)}
 SHADERS_LATER = "--no-prepare-shaders"
-NOT_PREPARED = re.compile(r"^the shaders were not prepared now \((.*)\): ")   # (make_game.py NOT_PREPARED)
+NOT_PREPARED = re.compile(r"^the shaders were not prepared now \((.*)\): (.*)$")   # (make_game.py NOT_PREPARED)
+FIRST_START = "the game prepares them at its first start"   # (make_game.py FIRST_START)
+
+
+def shaders_note(m):
+    """The shaders row's line for make_game's not-prepared line: left to the first start and why, or (the GPU driver stopped
+    responding) why and what happens instead"""
+    why, then = m.groups()
+    return ("Left to the game's first start: %s" % why if then == FIRST_START
+            else "Not prepared: %s. %s" % (why, then[:1].upper() + then[1:]))
 
 DLSS_LICENSE = (
     "NVIDIA DLSS is NVIDIA's, not Hookshot's. With it ticked, the build downloads NVIDIA's DLSS SDK (release v310.9.16) from "
     "github.com/NVIDIA/DLSS, under NVIDIA's own license, the NVIDIA RTX SDKs license:\n\n"
     "https://github.com/NVIDIA/DLSS/blob/9981c6350dc58c0ce21f024fd65e31e851c31689/LICENSE.txt\n\n"
-    "Its files stay on this PC (in the builder's ngx-sdk folder, and nvngx_dlss.dll in the game folder's ngx folder). "
+    "Its files stay on this PC (in the builder's ngx-sdk folder, and nvngx_dlss.dll and nvngx_dlssg.dll in the game "
+    "folder's ngx folder). "
     "Hookshot never includes or shares them: never share a game folder built with them.\n\nDo you accept NVIDIA's license?")
 
 
@@ -1458,7 +1468,7 @@ class Window(QWidget):
         elif line.startswith("@@done "):
             self.finished = line[7:]
         elif NOT_PREPARED.match(line):
-            self.shaders_later = NOT_PREPARED.match(line).group(1)
+            self.shaders_later = shaders_note(NOT_PREPARED.match(line))
         elif self.FILES_LINE.match(line):
             self.files_of = int(self.FILES_LINE.match(line).group(1))
         elif self.FILE_LINE.match(line):
@@ -1525,7 +1535,7 @@ class Window(QWidget):
         self.runner = None
         if self.finished:
             for sid, r in self.rows.items():
-                why = None if sid != "shaders" else ("Left to the game's first start: %s" % self.shaders_later if self.shaders_later else
+                why = None if sid != "shaders" else (self.shaders_later if self.shaders_later else
                                                     None if self.shaders_began else "Left to the game's first start")
                 if why:
                     r.skipped()

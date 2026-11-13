@@ -18,13 +18,15 @@ static struct {
         *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface, *GetWindowDisplay, *GetCurrentDisplayMode;
     /* sound */
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
+    void *CloseAudioDevice, *DestroyAudioStream;
     /* controllers */
     void *PadOpen, *PadClose, *PadConnected, *PadsUpdate, *PadButton, *PadAxis, *PadName, *PadRumble;
     void *PadType, *PadEffect;   /* (optional: HD rumble, host/pad_sdl.c) */
     void *PadHasSensor, *PadSensorEnable, *PadSensorData;   /* (motion: optional, NULL in an SDL without them) */
     void *PadVendor, *PadSteamHandle, *SetHintPriority;   /* (Steam's stand-in pads: optional, host/steam_pads.h) */
+    void *JoystickGUID, *PadMapping;   /* (optional connection diagnostics: no serial number or device path) */
     void *GetGamepads, *GetGamepadID, *Free;   /* (SDL3) */
-    void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2) */
+    void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2; GetJoystick also SDL3's diagnostics) */
 } f;
 #define CALL(type, fn) ((type)f.fn)
 
@@ -77,12 +79,16 @@ static int get_all(HMODULE m, int three) {
     *(FARPROC *)&f.PadVendor = GetProcAddress(m, three ? "SDL_GetGamepadVendor" : "SDL_GameControllerGetVendor");
     *(FARPROC *)&f.PadSteamHandle = GetProcAddress(m, three ? "SDL_GetGamepadSteamHandle" : "SDL_GameControllerGetSteamHandle");
     *(FARPROC *)&f.SetHintPriority = GetProcAddress(m, "SDL_SetHintWithPriority");
+    *(FARPROC *)&f.JoystickGUID = GetProcAddress(m, three ? "SDL_GetJoystickGUID" : "SDL_JoystickGetGUID");
+    *(FARPROC *)&f.PadMapping = GetProcAddress(m, three ? "SDL_GetGamepadMapping" : "SDL_GameControllerMapping");
     if (three) {
+        *(FARPROC *)&f.GetJoystick = GetProcAddress(m, "SDL_GetGamepadJoystick");   /* (optional: diagnostics only) */
         GET(SetWindowPosition, "SDL_SetWindowPosition");
         GET(GetPrimaryDisplay, "SDL_GetPrimaryDisplay");
         GET(OpenAudioDeviceStream, "SDL_OpenAudioDeviceStream");
         GET(ResumeAudioStreamDevice, "SDL_ResumeAudioStreamDevice");
         GET(PutAudioStreamData, "SDL_PutAudioStreamData");
+        GET(DestroyAudioStream, "SDL_DestroyAudioStream");
         GET(GetGamepads, "SDL_GetGamepads");
         GET(GetGamepadID, "SDL_GetGamepadID");
         GET(Free, "SDL_free");
@@ -92,10 +98,12 @@ static int get_all(HMODULE m, int three) {
         *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetDisplayForWindow");   /* (the refresh: hos_sdl_refresh_mhz) */
         *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
     } else {
+        *(FARPROC *)&f.Free = GetProcAddress(m, "SDL_free");   /* (optional: do not request an allocated mapping without it) */
         *(FARPROC *)&f.GetWindowDisplay = GetProcAddress(m, "SDL_GetWindowDisplayIndex");   /* (the refresh: hos_sdl_refresh_mhz) */
         *(FARPROC *)&f.GetCurrentDisplayMode = GetProcAddress(m, "SDL_GetCurrentDisplayMode");
         GET(OpenAudioDevice, "SDL_OpenAudioDevice");
         GET(PauseAudioDevice, "SDL_PauseAudioDevice");
+        GET(CloseAudioDevice, "SDL_CloseAudioDevice");
         GET(NumJoysticks, "SDL_NumJoysticks");
         GET(IsGameController, "SDL_IsGameController");
         GET(DeviceInstanceID, "SDL_JoystickGetDeviceInstanceID");
@@ -176,6 +184,9 @@ void hos_sdl_relative_mouse(void *window, int on) {
     else CALL(int (*)(int), SetRelativeMouseMode)(on);
 }
 int hos_sdl_desktop_size(int *width, int *height) {
+    /* (hookshot) no SDL loaded (a windowless start: HOS_HEADLESS), so the screen is unknown. The menu asks while it runs
+       (MkwVkHost.screen_size, rx_backend.c), and SDL2's branch below would call an empty slot */
+    if (!version) return 0;
     if (version == 3) {   /* (SDL_DisplayMode: displayID, format, w and h at 8 and 12 in screen units, pixel_density at
                              16: in pixels, as SDL2 gave them) */
         const uint8_t *m = CALL(const uint8_t *(*)(uint32_t), GetDesktopDisplayMode)(CALL(uint32_t (*)(void), GetPrimaryDisplay)());
@@ -333,6 +344,8 @@ typedef struct {
     void (*pull)(void *user, uint8_t *out, int len);
     void *user;
     int frame;   /* bytes a sample frame (all channels) */
+    void *stream;   /* (SDL3: the stream, which holds the device) */
+    uint32_t dev;   /* (SDL2: the device) */
 } Pull;
 static void pull3(void *p, void *stream, int want, int total) {   /* (SDL3: a stream asks for want more bytes) */
     (void)total;
@@ -351,21 +364,22 @@ static void pull2(void *p, uint8_t *out, int len) {   /* (SDL2: a device callbac
     const Pull *s = (const Pull *)p;
     s->pull(s->user, out, len);
 }
-int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user) {
-    if (!hos_sdl_load()) return 0;
+void *hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user) {
+    if (!hos_sdl_load()) return NULL;
     const uint16_t format = s16 ? 0x8010 /* S16LE */ : 0x8120 /* F32LE */;   /* (both's numbers) */
     const char *env_samples = getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES");
     if (version == 3 && !env_samples) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "480");   /* (SDL2's device buffer below) */
-    if (!hos_sdl_init(HOS_SDL_AUDIO)) return 0;
+    if (!hos_sdl_init(HOS_SDL_AUDIO)) return NULL;
     Pull *p = (Pull *)calloc(1, sizeof *p);
     p->pull = pull, p->user = user, p->frame = channels * (s16 ? 2 : 4);
     if (version == 3) {
         const struct { uint32_t format; int channels, freq; } spec = {format, channels, freq};
         void *stream = CALL(void *(*)(uint32_t, const void *, void (*)(void *, void *, int, int), void *), OpenAudioDeviceStream)(
             0xFFFFFFFFu /* the default output */, &spec, pull3, p);
-        if (stream && CALL(_Bool (*)(void *), ResumeAudioStreamDevice)(stream)) return 1;
+        if (stream && CALL(_Bool (*)(void *), ResumeAudioStreamDevice)(stream)) return p->stream = stream, p;
+        if (stream) CALL(void (*)(void *), DestroyAudioStream)(stream);
         free(p);
-        return 0;
+        return NULL;
     }
     struct {
         int freq;
@@ -384,10 +398,18 @@ int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user,
     const uint32_t dev = CALL(uint32_t (*)(const char *, int, const void *, void *, int), OpenAudioDevice)(NULL, 0, &want, &have, 0);
     if (!dev) {
         free(p);
-        return 0;
+        return NULL;
     }
     CALL(void (*)(uint32_t, int), PauseAudioDevice)(dev, 0);
-    return 1;
+    p->dev = dev;
+    return p;
+}
+void hos_sdl_audio_close(void *out) {   /* (pull is not called again once this returns) */
+    Pull *p = (Pull *)out;
+    if (!p) return;
+    if (version == 3) CALL(void (*)(void *), DestroyAudioStream)(p->stream);   /* (and the device it opened) */
+    else CALL(void (*)(uint32_t), CloseAudioDevice)(p->dev);
+    free(p);
 }
 /* SDL3's format of the default device; SDL2's default audio info (2.24 on: the bundled 2.32 has it). Looked up here,
    not at load: an SDL without it still plays, in stereo. */
@@ -611,6 +633,49 @@ int16_t hos_sdl_pad_axis(void *pad, int axis) { return CALL(int16_t (*)(void *, 
 const char *hos_sdl_pad_name(void *pad) {
     const char *n = CALL(const char *(*)(void *), PadName)(pad);
     return n ? n : "?";
+}
+/* SDL_GUID / SDL_JoystickGUID: the same 16-byte hardware identifier in both ABIs, not the device's serial number. */
+typedef struct { uint8_t data[16]; } HosSdlGuid;
+void hos_sdl_pad_log_connection(void *pad, int motion, int steam) {
+    char guid[33] = "unavailable";
+    if (f.GetJoystick && f.JoystickGUID) {
+        void *joystick = CALL(void *(*)(void *), GetJoystick)(pad);
+        if (joystick) {
+            const HosSdlGuid id = CALL(HosSdlGuid (*)(void *), JoystickGUID)(joystick);
+            static const char hex[] = "0123456789abcdef";
+            unsigned any = 0;
+            for (int i = 0; i < 16; i++) {
+                guid[2 * i] = hex[id.data[i] >> 4], guid[2 * i + 1] = hex[id.data[i] & 15];
+                any |= id.data[i];
+            }
+            guid[32] = 0;
+            if (!any) strcpy(guid, "unknown");
+        }
+    }
+    /* The active mapping may be from a database, the driver or a user override: SDL does not report its origin.
+       NULL is not evidence that SDL chose a default. The returned string belongs to SDL's allocator. */
+    const int can_map = f.PadMapping && f.Free;
+    char *mapping = can_map ? CALL(char *(*)(void *), PadMapping)(pad) : NULL;
+    const char *status = !can_map ? "unavailable" : mapping ? "available" : "none";
+    const char *name = mapping ? strchr(mapping, ',') : NULL;
+    int name_len = 1;
+    if (name) {
+        name++;
+        for (name_len = 0; name_len < 128 && name[name_len] && name[name_len] != ','; name_len++) {}
+    } else name = "?";
+    int mapping_len = 0;
+    if (mapping)
+        while (mapping_len < 1024 && mapping[mapping_len]) mapping_len++;
+    hos_log("hid: controller \"%.128s\" connected (SDL)%s%s; guid=%s; mapping=%s; mapping-name=\"%.*s\"",
+            hos_sdl_pad_name(pad), motion ? ", with a gyroscope" : "", steam ? ", Steam Input's" : "",
+            guid, status, name_len, name);
+    /* hos_log has a 1024-byte message buffer: keep the capped mapping intact in labelled 512-byte parts. */
+    for (int at = 0; at < mapping_len; at += 512) {
+        const int n = mapping_len - at < 512 ? mapping_len - at : 512;
+        hos_log("hid: guid=%s; mapping-string[%d/%d]=\"%.*s\"%s", guid, at / 512 + 1, (mapping_len + 511) / 512,
+                n, mapping + at, at + n == mapping_len && mapping[mapping_len] ? " (truncated)" : "");
+    }
+    if (mapping) CALL(void (*)(void *), Free)(mapping);
 }
 int32_t hos_sdl_pad_id(void *pad) {
     return version == 3 ? (int32_t)CALL(uint32_t (*)(void *), GetGamepadID)(pad)

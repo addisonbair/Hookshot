@@ -12,6 +12,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <string>
@@ -67,6 +68,9 @@ VkPipeline last_pipeline{};
 struct { bool on=false; } vertex_set,last_ib;
 void descriptors_disturbed() {}
 std::unordered_map<int,int>& handle_hits() { static std::unordered_map<int,int> h;return h; }
+// (vk_draw.cpp's front cache of handle_hits, #2960: emptied with it, nothing else read here)
+struct ViewFast { uint64_t key = ~0ull; };
+std::array<ViewFast, 1024>& view_fast() { static thread_local std::array<ViewFast, 1024> a; return a; }
 struct BankCache { uint64_t at=0; };
 std::array<std::array<BankCache,2>,2>& bank_cache() { static std::array<std::array<BankCache,2>,2> b;return b; }
 void make_dummies() {}
@@ -75,9 +79,10 @@ struct Use { BufferRef ref;std::vector<uint8_t> expected; };
 std::vector<Use> pending;
 // A slot is recycled through the actual wait/begin functions, not a CPU frame count.
 void read_pending();
-struct Recording { int slot=0; VkCommandBuffer cmd{},upload{};VkCommandPool pool{},upload_pool{};VkFence fence{};uint64_t value=0,batch=0;bool submitted=false; };
+struct Recording { int slot=0; VkCommandBuffer cmd{},upload{};VkCommandPool pool{},upload_pool{};VkFence fence{};uint64_t value=0,batch=0,part=0;bool submitted=false; };
 constexpr int kRecordings=2;
 Recording recordings[kRecordings];int recording_index=0;
+uint64_t rec_part_next=0;   // (the readback's part numbers: gpu/vk/vk_replay.cpp's begin_recording)
 VkSemaphore batch_tl{};uint64_t batch_flushed=0;int flush_reason=0;constexpr int FR_SLOT=1;
 int64_t st_wait_ns=0;
 #define PROF(x) ((void)0)
@@ -85,7 +90,7 @@ void queue_flush_locked(){batch_flushed=1;}
 void gpu_time_collect(Recording&){} void gprof_collect(int){} void gpu_time_begin(Recording&){}
 void gprof_begin_recording(int,VkCommandBuffer,VkCommandBuffer){}
 uint64_t completed(){return 0;}
-void memory_recording_value(uint64_t,uint64_t){} void texture_begin_recording(VkCommandBuffer,uint64_t){}
+void memory_recording_value(uint64_t,uint64_t){} void memory_recording_part(uint64_t){} void texture_begin_recording(VkCommandBuffer,uint64_t){}
 VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice,uint32_t,const VkFence*,VkBool32,uint64_t){read_pending();pending.clear();return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice,uint32_t,const VkFence*){return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice,const VkSemaphoreWaitInfo* info,uint64_t){require(info->semaphoreCount==1 && *info->pValues<=batch_flushed,"held batch must be submitted before its GPU wait");read_pending();pending.clear();return VK_SUCCESS;}

@@ -8,20 +8,13 @@ import argparse
 import subprocess
 import tempfile
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # (tests/srccut.py: python -I leaves this folder off the path)
+from srccut import block   # noqa: E402
 
 RUN_ALL_ARGS = ["--cxx", "g++"]
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def block(text, marker):
-    start = text.index(marker)
-    end = text.index("{", start) + 1
-    depth = 1
-    while depth:
-        depth += (text[end] == "{") - (text[end] == "}")
-        end += 1
-    return text[start:end]
 
 
 def need(where, text, needles):
@@ -62,7 +55,9 @@ def check_source():
           # (and what the other rules ask on their own is kept from before the hold's lines, the 97% rule's with it, for the
           # pass's third tier: a texture unused for the eviction's own time goes for that part)
           "uint64_t rule_budget = budget;", "rule_budget = std::min(rule_budget, total_bytes > over ? total_bytes - over : 0);",
-          "const uint64_t rule_to = vram_compact::rule_target(total_bytes, rule_budget);",
+          "const uint64_t size_budget = budget;", 'getenv("RX_VK_EVICT_EXCESS")',
+          "const uint64_t rule_to = excess_only ? vram_compact::rule_target(total_bytes, size_budget, rule_budget)",
+          ": vram_compact::rule_target(total_bytes, rule_budget);",
           "if (to == UINT64_MAX || vram_compact::hold_met(total_bytes, hold_live, hold_dead, to)) continue;",
           # (the reserve: a lower line that sets the budget too, the hold's own line kept for the textures not long unused;
           # the driver's limit, when it asks for more, clears both)

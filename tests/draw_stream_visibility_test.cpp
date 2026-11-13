@@ -11,6 +11,7 @@
 #include <deque>
 #include <exception>
 #include <map>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <string>
@@ -63,12 +64,15 @@ VkPipeline last_pipeline{};
 struct { bool on=false; } vertex_set,last_ib;
 void descriptors_disturbed() {}
 std::unordered_map<int,int>& handle_hits() { static std::unordered_map<int,int> h;return h; }
+// (vk_draw.cpp's front cache of handle_hits, #2960: emptied with it, nothing else read here)
+struct ViewFast { uint64_t key = ~0ull; };
+std::array<ViewFast, 1024>& view_fast() { static thread_local std::array<ViewFast, 1024> a; return a; }
 struct BankCache { uint64_t at=0; };
 std::array<std::array<BankCache,2>,2>& bank_cache() { static std::array<std::array<BankCache,2>,2> b;return b; }
 void make_dummies() {}
 /* FLUSH */
 /* BEGIN */
-struct Recording { int slot;VkCommandBuffer cmd,upload,init; VkFence fence;uint64_t value=1,batch=0;bool submitted=false; };
+struct Recording { int slot;VkCommandBuffer cmd,upload,init; VkFence fence;uint64_t value=1,batch=0,part=0;bool submitted=false; };
 struct Expected { BufferRef ref;std::vector<uint8_t> bytes; };
 std::map<VkCommandBuffer,std::vector<Expected>> expected;
 std::vector<int> submitted_slots;
@@ -80,6 +84,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer) { return VK_S
 VkSemaphore timeline{},rec_timeline{};
 uint64_t rec_seq=0;
 std::mutex rec_map_mu;
+// (the readback's part bookkeeping and the held-submit flag: gpu/vk/vk_replay.cpp)
+uint64_t rec_part_next = 0;
+std::map<uint64_t,uint64_t> part_rec;
+std::condition_variable rec_map_cv;
+std::atomic<bool> pend_held{false};
 std::multimap<uint64_t,uint64_t> value_rec;
 std::set<uint64_t> rec_open_values;
 struct { std::vector<VkCommandBufferSubmitInfo> cbs;uint64_t signal=0,rec=0;bool any_signal=false;uint64_t reflex=0; } pend;
